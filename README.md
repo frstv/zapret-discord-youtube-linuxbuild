@@ -1,8 +1,7 @@
 # zapret-discord-youtube для Linux
 
-Linux-порт актуальной сборки [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube). Все 22 стратегии версии **1.10.4** перенесены без изменения параметров DPI. Вместо Windows-драйвера WinDivert используется штатный для Linux обработчик **nfqws v72.13** и отдельная таблица `nftables`.
+Linux-порт [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube). Сборка рассчитана на обычный Linux-компьютер с архитектурой **x86_64**, `systemd` и `nftables`
 
-Сборка рассчитана на обычный Linux-компьютер с архитектурой **x86_64**, `systemd` и `nftables`. Приложенный `nfqws` статически скомпилирован, поэтому дополнительные библиотеки ему не нужны.
 
 ## Быстрый запуск
 
@@ -127,13 +126,3 @@ sudo nft list table inet zapret_flowseal
 journalctl -u zapret-flowseal -b
 ```
 
-Если Discord или YouTube не открывается, сначала включите Secure DNS, затем пробуйте другие стратегии. Результат зависит от провайдера и используемого DPI; универсальной стратегии для всех сетей нет.
-
-## Состав и происхождение файлов
-
-- стратегии, списки и fake-пакеты: Flowseal `1.10.4`, commit `176f56dc3f11ce5915c26abcdde903f93d835b64`;
-- `bin/nfqws`: официальный релиз bol-van/zapret `v72.13`, commit `87e058624c72863db53bdaf7fb6f16576dddb6ab`;
-- SHA-256 `bin/nfqws`: `f34615964d7321650197cd69d3f7cbfdaabe8118b5a0d57c6e41dccdff658999`;
-- SHA-256 официального архива zapret v72.13: `25c74e6c5f48963fa244c2955e76694a07c39447245a0457e2efdc74b3317e68`.
-
-Лицензия исходной сборки находится в `LICENSE.txt`.
