@@ -6,6 +6,12 @@ Linux-порт актуальной сборки [Flowseal/zapret-discord-youtub
 
 ## Быстрый запуск
 
+После клонирования один раз назначьте исполняемые права:
+
+```bash
+chmod +x zapret-linux service.sh install.sh uninstall.sh bin/nfqws tools/import-strategies.pl
+```
+
 Установите `nftables`, если его ещё нет:
 
 ```bash
