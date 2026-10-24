@@ -1,0 +1,17 @@
+[Unit]
+Description=Flowseal zapret for Discord and YouTube (Linux)
+Documentation=https://github.com/Flowseal/zapret-discord-youtube
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=@INSTALL_DIR@/zapret-linux start
+ExecStop=@INSTALL_DIR@/zapret-linux stop
+ExecReload=@INSTALL_DIR@/zapret-linux restart
+RemainAfterExit=yes
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
