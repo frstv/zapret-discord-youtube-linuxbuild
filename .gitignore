@@ -1,0 +1,5 @@
+state/*.pid
+state/*.log
+state/installed-path
+state/test-results.txt
+

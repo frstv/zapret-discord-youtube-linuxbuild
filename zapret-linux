@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+BIN_DIR="$ROOT_DIR/bin"
+LISTS_DIR="$ROOT_DIR/lists"
+STRATEGIES_DIR="$ROOT_DIR/strategies"
+STATE_DIR="$ROOT_DIR/state"
+CONFIG_FILE="$ROOT_DIR/config.env"
+NFQWS="$BIN_DIR/nfqws"
+PID_FILE="$STATE_DIR/nfqws.pid"
+NFT_FAMILY=inet
+NFT_TABLE=zapret_flowseal
+DESYNC_MARK=0x40000000
+
+STRATEGY=general
+GAME_FILTER=disabled
+GAME_TCP_PORTS=1024-65535
+GAME_UDP_PORTS=1024-65535
+QUEUE_NUM=200
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+load_config() {
+    local key value
+    [[ -r "$CONFIG_FILE" ]] || die "не найден $CONFIG_FILE"
+    while IFS='=' read -r key value; do
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        case "$key" in
+            STRATEGY) STRATEGY="$value" ;;
+            GAME_FILTER) GAME_FILTER="$value" ;;
+            GAME_TCP_PORTS) GAME_TCP_PORTS="$value" ;;
+            GAME_UDP_PORTS) GAME_UDP_PORTS="$value" ;;
+            QUEUE_NUM) QUEUE_NUM="$value" ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+validate_port_list() {
+    local list="$1" item start end
+    [[ "$list" =~ ^[0-9,-]+$ ]] || return 1
+    IFS=',' read -ra items <<< "$list"
+    for item in "${items[@]}"; do
+        if [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
+        elif [[ "$item" =~ ^[0-9]+$ ]]; then
+            start="$item"; end="$item"
+        else
+            return 1
+        fi
+        (( start >= 1 && start <= 65535 && end >= start && end <= 65535 )) || return 1
+    done
+}
+
+validate_config() {
+    [[ "$STRATEGY" =~ ^[a-z0-9-]+$ ]] || die "некорректное имя стратегии"
+    [[ -f "$STRATEGIES_DIR/$STRATEGY.conf" ]] || die "неизвестная стратегия: $STRATEGY"
+    [[ "$GAME_FILTER" == disabled || "$GAME_FILTER" == all || "$GAME_FILTER" == tcp || "$GAME_FILTER" == udp ]] || die "GAME_FILTER должен быть disabled, all, tcp или udp"
+    validate_port_list "$GAME_TCP_PORTS" || die "некорректные TCP-порты Game Filter"
+    validate_port_list "$GAME_UDP_PORTS" || die "некорректные UDP-порты Game Filter"
+    [[ "$QUEUE_NUM" =~ ^[0-9]+$ ]] && (( QUEUE_NUM >= 0 && QUEUE_NUM <= 65535 )) || die "некорректный номер NFQUEUE"
+}
+
+need_root() {
+    if (( EUID != 0 )); then
+        have sudo || die "команда требует root; установите sudo или запустите от root"
+        exec sudo -- "$0" "$@"
+    fi
+}
+
+game_tcp() {
+    case "$GAME_FILTER" in all|tcp) printf '%s' "$GAME_TCP_PORTS" ;; *) printf '12' ;; esac
+}
+
+game_udp() {
+    case "$GAME_FILTER" in all|udp) printf '%s' "$GAME_UDP_PORTS" ;; *) printf '12' ;; esac
+}
+
+strategy_args() {
+    local file="$STRATEGIES_DIR/$1.conf" line
+    STRATEGY_ARGS=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        line="${line//@BIN@/$BIN_DIR}"
+        line="${line//@LISTS@/$LISTS_DIR}"
+        line="${line//@GAME_TCP@/$(game_tcp)}"
+        line="${line//@GAME_UDP@/$(game_udp)}"
+        STRATEGY_ARGS+=("$line")
+    done < "$file"
+}
+
+merge_ports() {
+    local list="$1"
+    awk -v list="$list" '
+        BEGIN {
+            n=split(list, token, ",")
+            for (i=1; i<=n; i++) {
+                if (index(token[i], "-")) split(token[i], edge, "-")
+                else { edge[1]=token[i]; edge[2]=token[i] }
+                start[i]=edge[1]+0; finish[i]=edge[2]+0
+                delete edge
+            }
+            for (i=1; i<=n; i++) for (j=i+1; j<=n; j++)
+                if (start[j] < start[i]) {
+                    t=start[i]; start[i]=start[j]; start[j]=t
+                    t=finish[i]; finish[i]=finish[j]; finish[j]=t
+                }
+            left=start[1]; right=finish[1]; out=""
+            for (i=2; i<=n; i++) {
+                if (start[i] <= right+1) { if (finish[i] > right) right=finish[i] }
+                else { out=out (out ? "," : "") (left == right ? left : left "-" right); left=start[i]; right=finish[i] }
+            }
+            print out (out ? "," : "") (left == right ? left : left "-" right)
+        }
+    '
+}
+
+tcp_ports() {
+    local ports='80,443,2053,2083,2087,2096,8443'
+    case "$GAME_FILTER" in all|tcp) ports+=",$GAME_TCP_PORTS" ;; esac
+    merge_ports "$ports"
+}
+
+udp_ports() {
+    local ports='443,19294-19344,50000-50100'
+    case "$GAME_FILTER" in all|udp) ports+=",$GAME_UDP_PORTS" ;; esac
+    merge_ports "$ports"
+}
+
+nft_up() {
+    local tcp udp
+    tcp="$(tcp_ports)"; udp="$(udp_ports)"
+    if nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+        nft delete table "$NFT_FAMILY" "$NFT_TABLE" || return 1
+    fi
+    nft add table "$NFT_FAMILY" "$NFT_TABLE" || return 1
+    if ! nft add chain "$NFT_FAMILY" "$NFT_TABLE" output '{ type filter hook output priority mangle; policy accept; }' ||
+       ! nft add rule "$NFT_FAMILY" "$NFT_TABLE" output meta mark and "$DESYNC_MARK" == 0 tcp dport "{ $tcp }" queue num "$QUEUE_NUM" bypass ||
+       ! nft add rule "$NFT_FAMILY" "$NFT_TABLE" output meta mark and "$DESYNC_MARK" == 0 udp dport "{ $udp }" queue num "$QUEUE_NUM" bypass; then
+        nft_down
+        return 1
+    fi
+}
+
+nft_down() {
+    nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || return 0
+    nft delete table "$NFT_FAMILY" "$NFT_TABLE"
+}
+
+is_running() {
+    local pid
+    [[ -r "$PID_FILE" ]] || return 1
+    read -r pid < "$PID_FILE"
+    [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+}
+
+start() {
+    is_running && die "zapret уже запущен (PID $(<"$PID_FILE"))"
+    [[ -x "$NFQWS" ]] || die "не найден исполняемый $NFQWS"
+    have nft || die "не установлен nftables (команда nft)"
+    mkdir -p "$STATE_DIR"
+    strategy_args "$STRATEGY"
+    "$NFQWS" --qnum="$QUEUE_NUM" --dpi-desync-fwmark="$DESYNC_MARK" --dry-run "${STRATEGY_ARGS[@]}" >/dev/null
+    nft_up || die "не удалось установить правила nftables"
+    if ! "$NFQWS" --qnum="$QUEUE_NUM" --dpi-desync-fwmark="$DESYNC_MARK" --daemon --pidfile="$PID_FILE" --debug=0 "${STRATEGY_ARGS[@]}"; then
+        nft_down
+        die "nfqws не запустился"
+    fi
+    sleep 0.1
+    is_running || { nft_down; die "nfqws завершился сразу после запуска"; }
+    say "zapret запущен: стратегия $STRATEGY, Game Filter $GAME_FILTER, PID $(<"$PID_FILE")"
+}
+
+stop() {
+    local pid i
+    if is_running; then
+        read -r pid < "$PID_FILE"
+        kill "$pid"
+        for i in {1..30}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    nft_down
+    say "zapret остановлен"
+}
+
+status() {
+    if is_running; then
+        say "Состояние: запущен (PID $(<"$PID_FILE"))"
+    else
+        say "Состояние: остановлен"
+    fi
+    say "Стратегия: $STRATEGY"
+    say "Game Filter: $GAME_FILTER (TCP $GAME_TCP_PORTS; UDP $GAME_UDP_PORTS)"
+    if have nft && nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+        say "nftables: правила установлены"
+    else
+        say "nftables: правил нет"
+    fi
+}
+
+list_strategies() {
+    local file name
+    for file in "$STRATEGIES_DIR"/*.conf; do
+        name="${file##*/}"; name="${name%.conf}"
+        [[ "$name" == "$STRATEGY" ]] && printf '* %s\n' "$name" || printf '  %s\n' "$name"
+    done
+}
+
+set_config() {
+    local key="$1" value="$2" tmp
+    tmp="$(mktemp "$ROOT_DIR/.config.env.XXXXXX")"
+    awk -v key="$key" -v value="$value" 'BEGIN { found=0 } $0 ~ "^" key "=" { print key "=" value; found=1; next } { print } END { if (!found) print key "=" value }' "$CONFIG_FILE" > "$tmp"
+    chmod --reference="$CONFIG_FILE" "$tmp"
+    (( EUID != 0 )) || chown --reference="$CONFIG_FILE" "$tmp"
+    mv -f "$tmp" "$CONFIG_FILE"
+}
+
+select_strategy() {
+    local name="$1"
+    [[ "$name" =~ ^[a-z0-9-]+$ && -f "$STRATEGIES_DIR/$name.conf" ]] || die "стратегия '$name' не найдена"
+    set_config STRATEGY "$name"
+    say "Выбрана стратегия $name. Перезапустите zapret для применения."
+}
+
+set_game_filter() {
+    local mode="$1" tcp="${2:-$GAME_TCP_PORTS}" udp="${3:-$GAME_UDP_PORTS}"
+    [[ "$mode" == disabled || "$mode" == all || "$mode" == tcp || "$mode" == udp ]] || die "режим: disabled, all, tcp или udp"
+    validate_port_list "$tcp" || die "некорректный TCP-диапазон"
+    validate_port_list "$udp" || die "некорректный UDP-диапазон"
+    set_config GAME_FILTER "$mode"
+    set_config GAME_TCP_PORTS "$tcp"
+    set_config GAME_UDP_PORTS "$udp"
+    say "Game Filter: $mode (TCP $tcp; UDP $udp). Перезапустите zapret для применения."
+}
+
+ipset_mode() {
+    local mode="$1" active="$LISTS_DIR/ipset-all.txt" backup="$LISTS_DIR/ipset-all.txt.backup"
+    case "$mode" in
+        none)
+            printf '203.0.113.113/32\n' > "$active"
+            ;;
+        any)
+            : > "$active"
+            ;;
+        loaded)
+            [[ -s "$backup" ]] || die "резервный IPSet отсутствует"
+            cp -f "$backup" "$active"
+            ;;
+        *) die "режим IPSet: none, loaded или any" ;;
+    esac
+    say "IPSet переключён в режим $mode. Перезапустите zapret для применения."
+}
+
+detect_ipset_mode() {
+    local active="$LISTS_DIR/ipset-all.txt"
+    if [[ ! -s "$active" ]]; then printf 'any';
+    elif grep -qx '203\.0\.113\.113/32' "$active" && [[ "$(wc -l < "$active")" -eq 1 ]]; then printf 'none';
+    else printf 'loaded'; fi
+}
+
+update_ipset() {
+    local url='https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/refs/heads/main/.service/ipset-service.txt'
+    local tmp mode
+    have curl || die "для обновления нужен curl"
+    tmp="$(mktemp "$STATE_DIR/ipset.XXXXXX")"
+    trap 'rm -f "$tmp"' RETURN
+    curl -fL --retry 3 "$url" -o "$tmp"
+    [[ -s "$tmp" ]] || die "получен пустой IPSet"
+    mode="$(detect_ipset_mode)"
+    cp -f "$tmp" "$LISTS_DIR/ipset-all.txt.backup"
+    [[ "$mode" == loaded ]] && cp -f "$tmp" "$LISTS_DIR/ipset-all.txt"
+    say "IPSet обновлён; текущий режим: $mode"
+}
+
+test_configs() {
+    local file name failed=0
+    for file in "$STRATEGIES_DIR"/*.conf; do
+        name="${file##*/}"; name="${name%.conf}"
+        strategy_args "$name"
+        if "$NFQWS" --qnum="$QUEUE_NUM" --dpi-desync-fwmark="$DESYNC_MARK" --dry-run "${STRATEGY_ARGS[@]}" >/dev/null 2>&1; then
+            printf 'OK   %s\n' "$name"
+        else
+            printf 'FAIL %s\n' "$name"
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+diagnose() {
+    local failed=0
+    [[ "$(uname -s)" == Linux ]] || { say 'FAIL: требуется Linux'; failed=1; }
+    [[ -x "$NFQWS" ]] && say "OK: $($NFQWS --version | head -n1)" || { say 'FAIL: nfqws отсутствует'; failed=1; }
+    have nft && say "OK: nftables найден ($(command -v nft))" || { say 'FAIL: nftables не установлен'; failed=1; }
+    [[ -e /proc/net/netfilter/nfnetlink_queue ]] && say 'OK: интерфейс NFQUEUE доступен' || say 'INFO: NFQUEUE будет проверен при запуске'
+    test_configs || failed=1
+    return "$failed"
+}
+
+foreground() {
+    local chosen="${1:-$STRATEGY}"
+    [[ -f "$STRATEGIES_DIR/$chosen.conf" ]] || die "стратегия '$chosen' не найдена"
+    STRATEGY="$chosen"
+    strategy_args "$STRATEGY"
+    nft_up || die "не удалось установить правила nftables"
+    trap 'nft_down' EXIT INT TERM
+    say "Стратегия $STRATEGY запущена в текущем терминале. Ctrl+C — остановить."
+    "$NFQWS" --qnum="$QUEUE_NUM" --dpi-desync-fwmark="$DESYNC_MARK" "${STRATEGY_ARGS[@]}"
+}
+
+usage() {
+    cat <<'EOF'
+Использование: ./zapret-linux <команда> [аргументы]
+
+  start | stop | restart | status    управление zapret
+  run [strategy]                     запуск в текущем терминале
+  list                               список стратегий
+  select <strategy>                  выбрать стратегию
+  game-filter <mode> [tcp] [udp]     mode: disabled/all/tcp/udp
+  ipset-mode <none|loaded|any>        режим IPSet как в Windows-сборке
+  update-ipset                       скачать свежий IPSet Flowseal
+  test                               проверить все конфигурации
+  diagnose                           проверить окружение и конфигурации
+EOF
+}
+
+load_config
+validate_config
+command="${1:-status}"
+shift || true
+case "$command" in
+    start) need_root start "$@"; start ;;
+    stop) need_root stop "$@"; stop ;;
+    restart) need_root restart "$@"; stop; start ;;
+    status) status ;;
+    run) need_root run "$@"; foreground "$@" ;;
+    list) list_strategies ;;
+    select) [[ $# -eq 1 ]] || die 'укажите одну стратегию'; select_strategy "$1" ;;
+    game-filter) [[ $# -ge 1 && $# -le 3 ]] || die 'укажите режим и, при необходимости, диапазоны TCP/UDP'; set_game_filter "$@" ;;
+    ipset-mode) [[ $# -eq 1 ]] || die 'укажите none, loaded или any'; ipset_mode "$1" ;;
+    update-ipset) update_ipset ;;
+    test) test_configs ;;
+    diagnose) diagnose ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 2 ;;
+esac
